@@ -8,23 +8,58 @@ RBAC, and observability.
 
 ## Table of Contents
 
-1. [Troubleshooting Methodology](#1-troubleshooting-methodology)
-2. [Essential Commands Cheat Sheet](#2-essential-commands-cheat-sheet)
-3. [Pod & Container Issues](#3-pod--container-issues)
-4. [Workload Controllers (Deployments, StatefulSets, DaemonSets, Jobs)](#4-workload-controllers)
-5. [Networking & Service Discovery](#5-networking--service-discovery)
-6. [DNS Issues](#6-dns-issues)
-7. [Ingress & Load Balancing](#7-ingress--load-balancing)
-8. [Storage & Persistent Volumes](#8-storage--persistent-volumes)
-9. [Node Issues](#9-node-issues)
-10. [Resource Management (CPU, Memory, OOM)](#10-resource-management)
-11. [Scheduling Problems](#11-scheduling-problems)
-12. [RBAC & Authentication](#12-rbac--authentication)
-13. [Control Plane Components](#13-control-plane-components)
-14. [ConfigMaps, Secrets & Environment](#14-configmaps-secrets--environment)
-15. [Image & Registry Issues](#15-image--registry-issues)
-16. [Observability & Logging](#16-observability--logging)
-17. [Quick Symptom → Cause Reference](#17-quick-symptom--cause-reference)
+- [Kubernetes Comprehensive Troubleshooting Guide](#kubernetes-comprehensive-troubleshooting-guide)
+  - [Table of Contents](#table-of-contents)
+  - [1. Troubleshooting Methodology](#1-troubleshooting-methodology)
+  - [2. Essential Commands Cheat Sheet](#2-essential-commands-cheat-sheet)
+  - [3. Pod \& Container Issues](#3-pod--container-issues)
+    - [Pod statuses and what they mean](#pod-statuses-and-what-they-mean)
+    - [CrashLoopBackOff](#crashloopbackoff)
+    - [ImagePullBackOff / ErrImagePull](#imagepullbackoff--errimagepull)
+    - [Pod stuck in Pending](#pod-stuck-in-pending)
+    - [Pod stuck Terminating](#pod-stuck-terminating)
+    - [Readiness vs Liveness vs Startup probes](#readiness-vs-liveness-vs-startup-probes)
+  - [4. Workload Controllers](#4-workload-controllers)
+    - [Deployments](#deployments)
+    - [StatefulSets](#statefulsets)
+    - [DaemonSets](#daemonsets)
+    - [Jobs \& CronJobs](#jobs--cronjobs)
+  - [5. Networking \& Service Discovery](#5-networking--service-discovery)
+    - [Service has no endpoints](#service-has-no-endpoints)
+    - [Testing connectivity](#testing-connectivity)
+    - [Service types recap](#service-types-recap)
+    - [NetworkPolicies](#networkpolicies)
+  - [6. DNS Issues](#6-dns-issues)
+  - [7. Ingress \& Load Balancing](#7-ingress--load-balancing)
+  - [8. Storage \& Persistent Volumes](#8-storage--persistent-volumes)
+    - [PVC stuck in Pending](#pvc-stuck-in-pending)
+    - [Mount failures](#mount-failures)
+    - [Access modes](#access-modes)
+  - [9. Node Issues](#9-node-issues)
+    - [NotReady nodes](#notready-nodes)
+      - [Network / CNI plugin not ready](#network--cni-plugin-not-ready)
+      - [Disk full](#disk-full)
+      - [Expired certificates](#expired-certificates)
+      - [Clock skew](#clock-skew)
+      - [Node lost connectivity to the API server](#node-lost-connectivity-to-the-api-server)
+    - [Cordon, drain, uncordon](#cordon-drain-uncordon)
+    - [Taints \& tolerations](#taints--tolerations)
+  - [10. Resource Management](#10-resource-management)
+    - [OOMKilled (exit code 137)](#oomkilled-exit-code-137)
+    - [Requests vs Limits](#requests-vs-limits)
+    - [QoS classes](#qos-classes)
+    - [CPU throttling](#cpu-throttling)
+    - [Quotas \& LimitRanges](#quotas--limitranges)
+  - [11. Scheduling Problems](#11-scheduling-problems)
+  - [12. RBAC \& Authentication](#12-rbac--authentication)
+  - [13. Control Plane Components](#13-control-plane-components)
+    - [etcd health](#etcd-health)
+    - [Certificate expiry](#certificate-expiry)
+  - [14. ConfigMaps, Secrets \& Environment](#14-configmaps-secrets--environment)
+  - [15. Image \& Registry Issues](#15-image--registry-issues)
+  - [16. Observability \& Logging](#16-observability--logging)
+  - [17. Quick Symptom → Cause Reference](#17-quick-symptom--cause-reference)
+    - [General principles](#general-principles)
 
 ---
 
@@ -427,9 +462,106 @@ Node conditions to watch:
 Common root causes:
 - kubelet crashed or misconfigured.
 - Container runtime (containerd/CRI-O) down: `systemctl status containerd`.
-- Network/CNI plugin not ready.
-- Disk full (`/var/lib/...`), expired certs, or clock skew.
-- Node lost connectivity to the API server.
+
+#### Network / CNI plugin not ready
+
+If the CNI plugin fails to initialize, the kubelet reports
+`NetworkPluginNotReady` and the node stays `NotReady` because Pods can't be
+assigned an IP. New Pods get stuck in `ContainerCreating`.
+
+```bash
+# Are the CNI agent Pods (Calico, Cilium, Flannel, etc.) healthy?
+kubectl get pods -n kube-system -o wide | grep -Ei 'calico|cilium|flannel|weave|cni'
+kubectl describe node <node> | grep -i networkplugin
+
+# On the node — confirm the CNI config and binaries exist
+ls /etc/cni/net.d/                 # Should contain a *.conf / *.conflist
+ls /opt/cni/bin/                   # Should contain the plugin binaries
+journalctl -u kubelet | grep -i cni
+```
+
+Fixes:
+- Re-deploy or restart the CNI DaemonSet (`kubectl rollout restart daemonset/<cni> -n kube-system`).
+- Ensure exactly **one** CNI config is in `/etc/cni/net.d/` (multiple configs conflict).
+- Verify the Pod CIDR matches the CNI's configured range.
+- Check that required kernel modules (e.g. `br_netfilter`) are loaded and
+  `net.bridge.bridge-nf-call-iptables=1` is set.
+
+#### Disk full
+
+`DiskPressure` triggers when the node's image or root filesystem crosses the
+kubelet eviction threshold (default ~85% / `nodefs.available<10%`). The kubelet
+evicts Pods and garbage-collects images; if it can't recover space, the node
+goes `NotReady`.
+
+```bash
+# On the node
+df -h /var/lib/kubelet /var/lib/containerd /var      # Find the full mount
+du -sh /var/lib/containerd/* 2>/dev/null | sort -h   # Largest consumers
+crictl images                                        # Unused images
+journalctl --disk-usage                              # Bloated system logs
+```
+
+Fixes:
+- Prune unused images/containers: `crictl rmi --prune`.
+- Rotate or vacuum logs: `journalctl --vacuum-size=500M`.
+- Clear orphaned Pod logs under `/var/log/pods` and `/var/lib/kubelet`.
+- Grow the disk/volume, or move container storage to a larger filesystem.
+
+#### Expired certificates
+
+The kubelet uses a client certificate (default valid ~1 year) to talk to the API
+server. When it expires, the node abruptly drops to `NotReady` with TLS / `x509:
+certificate has expired` errors in the kubelet log.
+
+```bash
+journalctl -u kubelet | grep -i x509
+# Inspect the kubelet client cert expiry
+openssl x509 -enddate -noout -in /var/lib/kubelet/pki/kubelet-client-current.pem
+# Control-plane certs (kubeadm)
+kubeadm certs check-expiration
+```
+
+Fixes:
+- Enable kubelet cert rotation (`--rotate-certificates`) so it renews
+  automatically.
+- Renew control-plane certs: `kubeadm certs renew all`, then restart the static
+  control-plane Pods / kubelet.
+- If the kubelet client cert is gone, delete the stale cert and restart the
+  kubelet so it re-bootstraps via the bootstrap token.
+
+#### Clock skew
+
+Significant time drift between a node and the control plane breaks TLS
+validation (certs appear "not yet valid" or "expired"), causing intermittent
+auth failures and `NotReady` flapping.
+
+```bash
+timedatectl status            # Check NTP sync state and offset
+chronyc tracking              # If using chrony
+```
+
+Fixes: enable and sync NTP/chrony, then restart the kubelet.
+
+#### Node lost connectivity to the API server
+
+If the kubelet can't reach the API server, it stops sending heartbeats
+(node leases) and the controller marks the node `NotReady` after
+`node-monitor-grace-period` (~40s). The node and its Pods may still be running.
+
+```bash
+# From the node — can it reach the API server?
+curl -k https://<apiserver>:6443/healthz
+ping <apiserver-ip>
+journalctl -u kubelet | grep -iE 'connection refused|timeout|dial tcp'
+```
+
+Causes & fixes:
+- Firewall / security group blocking port 6443 → open it.
+- Wrong API server address in `/etc/kubernetes/kubelet.conf` → correct and
+  restart the kubelet.
+- Control-plane load balancer or VIP down → restore it.
+- DNS failure resolving the API server hostname → fix node DNS / `/etc/hosts`.
 
 ### Cordon, drain, uncordon
 
